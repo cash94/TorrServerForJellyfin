@@ -107,7 +107,7 @@ Example:
 ```bash
 TorrServer-darwin-arm64 [--port PORT] [--path PATH] [--logpath LOGPATH] [--weblogpath WEBLOGPATH] [--rdb] [--httpauth] [--dontkill] [--ui] [--torrentsdir TORRENTSDIR] [--torrentaddr TORRENTADDR] [--pubipv4 PUBIPV4] [--pubipv6 PUBIPV6] [--searchwa] [--JlfnAddr "path"]
 ```
-For Jellyfin
+For Jellyfin:
 ```
 you need to specify the general path to the directory. Then, when adding a torrent, torrserver will create [--JlfnAddr "path"] along the path.  The torrFilms or torrSerials catalog, depending on the torrent you are adding, must be
 specified as a media library in jellyfin.
