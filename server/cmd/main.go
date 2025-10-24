@@ -47,6 +47,8 @@ type args struct {
 	MaxSize     string `arg:"-m" help:"max allowed stream size (in Bytes)"`
 	TGToken     string `arg:"-T" help:"telegram bot token"`
 	JlfnAddr    string `arg:"-j" help:"jellyfin path"`
+	JlfnSrv     string `arg:"-z" help:"jellyfin server"`
+	JlfnApi     string `arg:"-x" help:"jellyfin api"`
 }
 
 func (args) Version() string {
@@ -103,6 +105,14 @@ func main() {
 		settings.JlfnAddr = params.JlfnAddr
 	}
 
+	if params.JlfnSrv != "" {
+		settings.JlfnSrv = params.JlfnSrv
+	}
+
+	if params.JlfnApi != "" {
+		settings.JlfnApi = params.JlfnApi
+	}
+
 	if params.PubIPv4 != "" {
 		settings.PubIPv4 = params.PubIPv4
 	}
@@ -122,7 +132,7 @@ func main() {
 		}
 	}
 
-	server.Start(params.Port, params.IP, params.SslPort, params.SslCert, params.SslKey, params.Ssl, params.RDB, params.SearchWA, params.TGToken, params.JlfnAddr)
+	server.Start(params.Port, params.IP, params.SslPort, params.SslCert, params.SslKey, params.Ssl, params.RDB, params.SearchWA, params.TGToken, params.JlfnAddr, params.JlfnSrv, params.JlfnApi)
 	log.TLogln(server.WaitServer())
 	log.Close()
 	time.Sleep(time.Second * 3)
