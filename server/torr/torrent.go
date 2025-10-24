@@ -1,368 +1,341 @@
-package torr
+package api
 
 import (
-	"errors"
-	"sort"
-	"sync"
+	"net/http"
+	"strings"
+	"os"
+	"path/filepath"
+	"net/url"
+	"fmt"
 	"time"
 
+	"server/dlna"
+	"server/log"
+	set "server/settings"
+	"server/torr"
+	"server/torr/state"
+	"server/web/api/utils"
 	utils2 "server/utils"
 
-	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
-
-	"server/log"
-	"server/settings"
-	"server/torr/state"
-	cacheSt "server/torr/storage/state"
-	"server/torr/storage/torrstor"
-	"server/torr/utils"
+	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 )
 
-type Torrent struct {
-	Title    string
-	Category string
-	Poster   string
-	Data     string
-	*torrent.TorrentSpec
-
-	Stat      state.TorrentStat
-	Timestamp int64
-	Size      int64
-
-	*torrent.Torrent
-	muTorrent sync.Mutex
-
-	bt    *BTServer
-	cache *torrstor.Cache
-
-	lastTimeSpeed       time.Time
-	DownloadSpeed       float64
-	UploadSpeed         float64
-	BytesReadUsefulData int64
-	BytesWrittenData    int64
-
-	PreloadSize    int64
-	PreloadedBytes int64
-
-	DurationSeconds float64
-	BitRate         string
-
-	expiredTime time.Time
-
-	closed <-chan struct{}
-
-	progressTicker *time.Ticker
+// Action: add, get, set, rem, list, drop
+type torrReqJS struct {
+	requestI
+	Link     string `json:"link,omitempty"`
+	Hash     string `json:"hash,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Category string `json:"category,omitempty"`
+	Poster   string `json:"poster,omitempty"`
+	Data     string `json:"data,omitempty"`
+	SaveToDB bool   `json:"save_to_db,omitempty"`
 }
 
-func NewTorrent(spec *torrent.TorrentSpec, bt *BTServer) (*Torrent, error) {
-	// https://github.com/anacrolix/torrent/issues/747
-	if bt == nil || bt.client == nil {
-		return nil, errors.New("BT client not connected")
-	}
-	switch settings.BTsets.RetrackersMode {
-	case 1:
-		spec.Trackers = append(spec.Trackers, [][]string{utils.GetDefTrackers()}...)
-	case 2:
-		spec.Trackers = nil
-	case 3:
-		spec.Trackers = [][]string{utils.GetDefTrackers()}
-	}
-
-	trackers := utils.GetTrackerFromFile()
-	if len(trackers) > 0 {
-		spec.Trackers = append(spec.Trackers, [][]string{trackers}...)
-	}
-
-	goTorrent, _, err := bt.client.AddTorrentSpec(spec)
+// torrents godoc
+//
+//	@Summary		Handle torrents informations
+//	@Description	Allow to list, add, remove, get, set, drop, wipe torrents on server. The action depends of what has been asked.
+//
+//	@Tags			API
+//
+//	@Param			request	body	torrReqJS	true	"Torrent request. Available params for action: add, get, set, rem, list, drop, wipe. link required for add, hash required for get, set, rem, drop."
+//
+//	@Accept			json
+//	@Produce		json
+//	@Success		200
+//	@Router			/torrents [post]
+func torrents(c *gin.Context) {
+	var req torrReqJS
+	err := c.ShouldBindJSON(&req)
 	if err != nil {
-		return nil, err
+		c.AbortWithError(http.StatusBadRequest, err)
+		return
 	}
-
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
-	if tor, ok := bt.torrents[spec.InfoHash]; ok {
-		return tor, nil
-	}
-
-	timeout := time.Second * time.Duration(settings.BTsets.TorrentDisconnectTimeout)
-	if timeout > time.Minute {
-		timeout = time.Minute
-	}
-
-	torr := new(Torrent)
-	torr.Torrent = goTorrent
-	torr.Stat = state.TorrentAdded
-	torr.lastTimeSpeed = time.Now()
-	torr.bt = bt
-	torr.closed = goTorrent.Closed()
-	torr.TorrentSpec = spec
-	torr.AddExpiredTime(timeout)
-	torr.Timestamp = time.Now().Unix()
-
-	go torr.watch()
-
-	bt.torrents[spec.InfoHash] = torr
-	return torr, nil
-}
-
-func (t *Torrent) WaitInfo() bool {
-	if t.Torrent == nil {
-		return false
-	}
-
-	// Close torrent if no info in 1 minute + TorrentDisconnectTimeout config option
-	tm := time.NewTimer(time.Minute + time.Second*time.Duration(settings.BTsets.TorrentDisconnectTimeout))
-
-	select {
-	case <-t.Torrent.GotInfo():
-		t.cache = t.bt.storage.GetCache(t.Hash())
-		t.cache.SetTorrent(t.Torrent)
-		return true
-	case <-t.closed:
-		return false
-	case <-tm.C:
-		return false
-	}
-}
-
-func (t *Torrent) GotInfo() bool {
-	// log.TLogln("GotInfo state:", t.Stat)
-	if t.Stat == state.TorrentClosed {
-		return false
-	}
-	// assume we have info in preload state
-	// and dont override with TorrentWorking
-	if t.Stat == state.TorrentPreload {
-		return true
-	}
-	t.Stat = state.TorrentGettingInfo
-	if t.WaitInfo() {
-		t.Stat = state.TorrentWorking
-		t.AddExpiredTime(time.Second * time.Duration(settings.BTsets.TorrentDisconnectTimeout))
-		return true
-	} else {
-		t.Close()
-		return false
-	}
-}
-
-func (t *Torrent) AddExpiredTime(duration time.Duration) {
-	newExpiredTime := time.Now().Add(duration)
-	if t.expiredTime.Before(newExpiredTime) {
-		t.expiredTime = newExpiredTime
-	}
-}
-
-func (t *Torrent) watch() {
-	t.progressTicker = time.NewTicker(time.Second)
-	defer t.progressTicker.Stop()
-
-	for {
-		select {
-		case <-t.progressTicker.C:
-			go t.progressEvent()
-		case <-t.closed:
-			return
+	c.Status(http.StatusBadRequest)
+	switch req.Action {
+	case "add":
+		{
+			addTorrent(req, c)
+		}
+	case "addJlfn":
+		{
+			addJlfn(req, c)
+		}
+	case "get":
+		{
+			getTorrent(req, c)
+		}
+	case "set":
+		{
+			setTorrent(req, c)
+		}
+	case "rem":
+		{
+			remTorrent(req, c)
+		}
+	case "list":
+		{
+			listTorrents(c)
+		}
+	case "drop":
+		{
+			dropTorrent(req, c)
+		}
+	case "wipe":
+		{
+			wipeTorrents(c)
 		}
 	}
 }
 
-func (t *Torrent) progressEvent() {
-	if t.expired() {
-		if t.TorrentSpec != nil {
-			log.TLogln("Torrent close by timeout", t.TorrentSpec.InfoHash.HexString())
-		}
-		t.bt.RemoveTorrent(t.Hash())
+func addTorrent(req torrReqJS, c *gin.Context) {
+	if req.Link == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("link is empty"))
 		return
 	}
 
-	t.muTorrent.Lock()
-	if t.Torrent != nil && t.Torrent.Info() != nil {
-		st := t.Torrent.Stats()
-		deltaDlBytes := st.BytesRead.Int64() - t.BytesReadUsefulData
-		deltaUpBytes := st.BytesWritten.Int64() - t.BytesWrittenData
-		deltaTime := time.Since(t.lastTimeSpeed).Seconds()
-
-		t.DownloadSpeed = float64(deltaDlBytes) / deltaTime
-		t.UploadSpeed = float64(deltaUpBytes) / deltaTime
-
-		t.BytesReadUsefulData = st.BytesRead.Int64()
-		t.BytesWrittenData = st.BytesWritten.Int64()
-
-		if t.cache != nil {
-			t.PreloadedBytes = t.cache.GetState().Filled
-		}
-	} else {
-		t.DownloadSpeed = 0
-		t.UploadSpeed = 0
+	log.TLogln("add torrent", req.Link)
+	req.Link = strings.ReplaceAll(req.Link, "&amp;", "&")
+	torrSpec, err := utils.ParseLink(req.Link)
+	if err != nil {
+		log.TLogln("error parse link:", err)
+		c.AbortWithError(http.StatusBadRequest, err)
+		return
 	}
-	t.muTorrent.Unlock()
 
-	t.lastTimeSpeed = time.Now()
-	t.updateRA()
-}
-
-func (t *Torrent) updateRA() {
-	// t.muTorrent.Lock()
-	// defer t.muTorrent.Unlock()
-	// if t.Torrent != nil && t.Torrent.Info() != nil {
-	// 	pieceLen := t.Torrent.Info().PieceLength
-	// 	adj := pieceLen * int64(t.Torrent.Stats().ActivePeers) / int64(1+t.cache.Readers())
-	// 	switch {
-	// 	case adj < pieceLen:
-	// 		adj = pieceLen
-	// 	case adj > pieceLen*4:
-	// 		adj = pieceLen * 4
-	// 	}
-	// 	go t.cache.AdjustRA(adj)
+	tor, err := torr.AddTorrent(torrSpec, req.Title, req.Poster, req.Data, req.Category)
+	// if tor.Data != "" && set.BTsets.EnableDebug {
+	// 	log.TLogln("torrent data:", tor.Data)
 	// }
-	adj := int64(16 << 20) // 16 MB fixed RA
-	go t.cache.AdjustRA(adj)
-}
-
-func (t *Torrent) expired() bool {
-	return t.cache.Readers() == 0 && t.expiredTime.Before(time.Now()) && (t.Stat == state.TorrentWorking || t.Stat == state.TorrentClosed)
-}
-
-func (t *Torrent) Files() []*torrent.File {
-	if t.Torrent != nil && t.Torrent.Info() != nil {
-		files := t.Torrent.Files()
-		return files
+	// if tor.Category != "" && set.BTsets.EnableDebug {
+	// 	log.TLogln("torrent category:", tor.Category)
+	// }
+	if err != nil {
+		log.TLogln("error add torrent:", err)
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
 	}
-	return nil
-}
 
-func (t *Torrent) Hash() metainfo.Hash {
-	if t.Torrent != nil {
-		t.Torrent.InfoHash()
-	}
-	if t.TorrentSpec != nil {
-		return t.TorrentSpec.InfoHash
-	}
-	return [20]byte{}
-}
+	go func() {
+		if !tor.GotInfo() {
+			log.TLogln("error add torrent:", "timeout connection get torrent info")
+			return
+		}
 
-func (t *Torrent) Length() int64 {
-	if t.Info() == nil {
-		return 0
-	}
-	return t.Torrent.Length()
-}
-
-func (t *Torrent) NewReader(file *torrent.File) *torrstor.Reader {
-	if t.Stat == state.TorrentClosed {
-		return nil
-	}
-	reader := t.cache.NewReader(file)
-	return reader
-}
-
-func (t *Torrent) CloseReader(reader *torrstor.Reader) {
-	t.cache.CloseReader(reader)
-	t.AddExpiredTime(time.Second * time.Duration(settings.BTsets.TorrentDisconnectTimeout))
-}
-
-func (t *Torrent) GetCache() *torrstor.Cache {
-	return t.cache
-}
-
-func (t *Torrent) drop() {
-	t.muTorrent.Lock()
-	defer t.muTorrent.Unlock()
-	if t.Torrent != nil {
-		t.Torrent.Drop()
-		t.Torrent = nil
-	}
-}
-
-func (t *Torrent) Close() bool {
-	if settings.ReadOnly && t.cache != nil && t.cache.GetUseReaders() > 0 {
-		return false
-	}
-	t.Stat = state.TorrentClosed
-
-	t.bt.mu.Lock()
-	delete(t.bt.torrents, t.Hash())
-	t.bt.mu.Unlock()
-
-	t.drop()
-	return true
-}
-
-func (t *Torrent) Status() *state.TorrentStatus {
-	t.muTorrent.Lock()
-	defer t.muTorrent.Unlock()
-
-	st := new(state.TorrentStatus)
-
-	st.Stat = t.Stat
-	st.StatString = t.Stat.String()
-	st.Title = t.Title
-	st.Category = t.Category
-	st.Poster = t.Poster
-	st.Data = t.Data
-	st.Timestamp = t.Timestamp
-	st.TorrentSize = t.Size
-	st.BitRate = t.BitRate
-	st.DurationSeconds = t.DurationSeconds
-
-	if t.TorrentSpec != nil {
-		st.Hash = t.TorrentSpec.InfoHash.HexString()
-	}
-	if t.Torrent != nil {
-		st.Name = t.Torrent.Name()
-		st.Hash = t.Torrent.InfoHash().HexString()
-		st.LoadedSize = t.Torrent.BytesCompleted()
-
-		st.PreloadedBytes = t.PreloadedBytes
-		st.PreloadSize = t.PreloadSize
-		st.DownloadSpeed = t.DownloadSpeed
-		st.UploadSpeed = t.UploadSpeed
-
-		tst := t.Torrent.Stats()
-		st.BytesWritten = tst.BytesWritten.Int64()
-		st.BytesWrittenData = tst.BytesWrittenData.Int64()
-		st.BytesRead = tst.BytesRead.Int64()
-		st.BytesReadData = tst.BytesReadData.Int64()
-		st.BytesReadUsefulData = tst.BytesReadUsefulData.Int64()
-		st.ChunksWritten = tst.ChunksWritten.Int64()
-		st.ChunksRead = tst.ChunksRead.Int64()
-		st.ChunksReadUseful = tst.ChunksReadUseful.Int64()
-		st.ChunksReadWasted = tst.ChunksReadWasted.Int64()
-		st.PiecesDirtiedGood = tst.PiecesDirtiedGood.Int64()
-		st.PiecesDirtiedBad = tst.PiecesDirtiedBad.Int64()
-		st.TotalPeers = tst.TotalPeers
-		st.PendingPeers = tst.PendingPeers
-		st.ActivePeers = tst.ActivePeers
-		st.ConnectedSeeders = tst.ConnectedSeeders
-		st.HalfOpenPeers = tst.HalfOpenPeers
-
-		if t.Torrent.Info() != nil {
-			st.TorrentSize = t.Torrent.Length()
-
-			files := t.Files()
-			sort.Slice(files, func(i, j int) bool {
-				return utils2.CompareStrings(files[i].Path(), files[j].Path())
-			})
-			for i, f := range files {
-				st.FileStats = append(st.FileStats, &state.TorrentFileStat{
-					Id:     i + 1, // in web id 0 is undefined
-					Path:   f.Path(),
-					Length: f.Length(),
-				})
+		if tor.Title == "" {
+			tor.Title = torrSpec.DisplayName // prefer dn over name
+			tor.Title = strings.ReplaceAll(tor.Title, "rutor.info", "")
+			tor.Title = strings.ReplaceAll(tor.Title, "_", " ")
+			tor.Title = strings.Trim(tor.Title, " ")
+			if tor.Title == "" {
+				tor.Title = tor.Name()
 			}
 		}
-	}
 
-	return st
+		if req.SaveToDB {
+			torr.SaveTorrentToDB(tor)
+		}
+	}()
+	// TODO: remove
+	if set.BTsets.EnableDLNA {
+		dlna.Stop()
+		dlna.Start()
+	}
+	c.JSON(200, tor.Status())
 }
 
-func (t *Torrent) CacheState() *cacheSt.CacheState {
-	if t.Torrent != nil && t.cache != nil {
-		st := t.cache.GetState()
-		st.Torrent = t.Status()
-		return st
+func addJlfn(req torrReqJS, c *gin.Context) {
+
+	addTorrent(req , c)
+	
+	go func() {
+		time.Sleep(15 * time.Second)
+		req.Link = strings.ReplaceAll(req.Link, "&amp;", "&")
+		torrSpec, err := utils.ParseLink(req.Link)
+		if err != nil {
+			log.TLogln("error parse link:", err)
+			c.AbortWithError(http.StatusBadRequest, err)
+			return
+		}
+	
+		hash := torrSpec.InfoHash.String()
+		log.TLogln("new add torrent", hash)
+		log.TLogln("Name", torrSpec.DisplayName)
+		
+	
+		tor := torr.GetTorrent(hash)
+
+		if tor == nil {
+			log.TLogln("tor", "Не удалось получить торрент")
+			return
+		}
+	
+		basePath := set.JlfnAddr
+	
+		if basePath == "" {
+			log.TLogln("basePath", "Не указан путь до каталога")
+			return
+		}
+
+		if tor.Stat == state.TorrentInDB {
+			tor = torr.LoadTorrent(tor)
+			if tor == nil {
+				log.TLogln("LoadTorrent", "Не удалось загрузить торрент")
+				return
+			}
+		}
+		host := utils2.GetScheme(c) + "://" + c.Request.Host
+		torrents := tor.Status()
+
+		from := 0
+
+		// Создаем базовый путь для сохранения
+		CatPath := ""
+		if len(torrents.FileStats) > 1 {
+			CatPath = "torrSerials"
+		} else {
+			CatPath = "torrFilms"
+		}
+		
+	
+		torname := tor.Name()
+		basePath = filepath.Join(basePath, CatPath)
+		basePath = filepath.Join(basePath, torname)
+	
+		for i, f := range torrents.FileStats {
+			if i >= from {
+				if utils2.GetMimeType(f.Path) != "*/*" {
+					list := ""
+								
+					name := filepath.Base(f.Path)
+					list += host + "/stream/" + url.PathEscape(name) + "?link=" + torrents.Hash + "&index=" + fmt.Sprint(f.Id) + "&play"
+				
+					// Создаем имя файла .strm на основе имени файла
+					strmName := filepath.Base(f.Path)
+					strmName = strings.ReplaceAll(strmName, `/`, "") // strip starting / from param
+				
+					// Добавляем расширение .strm если его нет
+					if !strings.HasSuffix(strings.ToLower(strmName), ".strm") {
+						strmName += ".strm"
+					}
+				
+					// Полный путь к файлу = базовый путь + имя файла
+				
+					fullPath := filepath.Join(basePath, strmName)
+				
+					// Создаем директорию, если не существует
+					if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+						return
+					}
+				
+					// Создаем и записываем файл
+					if err := os.WriteFile(fullPath, []byte(list), 0644); err != nil {
+						return
+					}
+				}
+			}
+		}
+		go func() {
+			url := set.JlfnSrv
+			if url != "" {
+				url = url + "/library/refresh"
+				apikey := set.JlfnApi
+
+				if apikey !="" {
+					req, err := http.NewRequest("POST", url, nil)
+					if err != nil {
+						log.TLogln(err)
+					}
+					req.Header.Add("X-Emby-Token", apikey)
+
+					client := &http.Client{}
+					resp, err := client.Do(req)
+					if err != nil {
+						log.TLogln(err)
+					}
+					defer resp.Body.Close()
+				}
+			}
+
+			log.TLogln("Status:", resp.Status)
+			time.Sleep(15 * time.Second)
+			torr.DropTorrent(hash)
+		}()
+	}()
+	
+}
+
+func getTorrent(req torrReqJS, c *gin.Context) {
+	if req.Hash == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("hash is empty"))
+		return
 	}
-	return nil
+	tor := torr.GetTorrent(req.Hash)
+
+	if tor != nil {
+		st := tor.Status()
+		c.JSON(200, st)
+	} else {
+		c.Status(http.StatusNotFound)
+	}
+}
+
+func setTorrent(req torrReqJS, c *gin.Context) {
+	if req.Hash == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("hash is empty"))
+		return
+	}
+	torr.SetTorrent(req.Hash, req.Title, req.Poster, req.Category, req.Data)
+	c.Status(200)
+}
+
+func remTorrent(req torrReqJS, c *gin.Context) {
+	if req.Hash == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("hash is empty"))
+		return
+	}
+	torr.RemTorrent(req.Hash)
+	// TODO: remove
+	if set.BTsets.EnableDLNA {
+		dlna.Stop()
+		dlna.Start()
+	}
+	c.Status(200)
+}
+
+func listTorrents(c *gin.Context) {
+	list := torr.ListTorrent()
+	if len(list) == 0 {
+		c.JSON(200, []*state.TorrentStatus{})
+		return
+	}
+	var stats []*state.TorrentStatus
+	for _, tr := range list {
+		stats = append(stats, tr.Status())
+	}
+	c.JSON(200, stats)
+}
+
+func dropTorrent(req torrReqJS, c *gin.Context) {
+	if req.Hash == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("hash is empty"))
+		return
+	}
+	torr.DropTorrent(req.Hash)
+	c.Status(200)
+}
+
+func wipeTorrents(c *gin.Context) {
+	torrents := torr.ListTorrent()
+	for _, t := range torrents {
+		torr.RemTorrent(t.TorrentSpec.InfoHash.HexString())
+	}
+	// TODO: remove (copied todo from remTorrent())
+	if set.BTsets.EnableDLNA {
+		dlna.Stop()
+		dlna.Start()
+	}
+	c.Status(200)
 }
