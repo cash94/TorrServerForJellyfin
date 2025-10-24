@@ -256,10 +256,10 @@ func addJlfn(req torrReqJS, c *gin.Context) {
 						log.TLogln(err)
 					}
 					defer resp.Body.Close()
+					log.TLogln("Status:", resp.Status)
 				}
 			}
 
-			log.TLogln("Status:", resp.Status)
 			time.Sleep(15 * time.Second)
 			torr.DropTorrent(hash)
 		}()
