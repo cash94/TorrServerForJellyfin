@@ -96,6 +96,8 @@ On FreeBSD (TrueNAS/FreeNAS) you can use this plugin: <https://github.com/filka9
 - `--torrentsdir TORRENTSDIR`, `-t TORRENTSDIR` - autoload torrents from dir
 - `--torrentaddr TORRENTADDR` - Torrent client address (format [IP]:PORT, ex. :32000, 127.0.0.1:32768 etc)
 - `--jlfnaddr JELLYFINPATH`, `-j JELLYFINPATH` - Path to the jellyfin metadata directory
+- `--JlfnSrv JELLYFINSERVER`, `-z JELLYFINSERVER` - URL jellyfin
+- `--JlfnApi JELLYFINAPI`, `-j JELLYFINAPI` - API KEY FOR jellyfin
 - `--pubipv4 PUBIPV4`, `-4 PUBIPV4` - set public IPv4 addr
 - `--pubipv6 PUBIPV6`, `-6 PUBIPV6` - set public IPv6 addr
 - `--searchwa`, `-s` - allow search without authentication
