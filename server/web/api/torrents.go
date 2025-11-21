@@ -162,26 +162,28 @@ func addJlfn(req torrReqJS, c *gin.Context) {
 	
 		hash := torrSpec.InfoHash.String()
 		log.TLogln("new add torrent", hash)
+		log.TLogln("Name", torrSpec.DisplayName)
+		
 	
 		tor := torr.GetTorrent(hash)
 
 		if tor == nil {
+			log.TLogln("tor", "Не удалось получить торрент")
 			return
-			log.TLogln("tor", "null")
 		}
 	
 		basePath := set.JlfnAddr
 	
 		if basePath == "" {
+			log.TLogln("basePath", "Не указан путь до каталога")
 			return
-			log.TLogln("basePath", "null")
 		}
 
 		if tor.Stat == state.TorrentInDB {
 			tor = torr.LoadTorrent(tor)
 			if tor == nil {
+				log.TLogln("LoadTorrent", "Не удалось загрузить торрент")
 				return
-				log.TLogln("LoadTorrent", "null")
 			}
 		}
 		host := utils2.GetScheme(c) + "://" + c.Request.Host
@@ -216,7 +218,7 @@ func addJlfn(req torrReqJS, c *gin.Context) {
 				
 					// Добавляем расширение .strm если его нет
 					if !strings.HasSuffix(strings.ToLower(strmName), ".strm") {
-						strmName += ".strm"
+						strmName += "[torrserver].strm"
 					}
 				
 					// Полный путь к файлу = базовый путь + имя файла
@@ -236,6 +238,28 @@ func addJlfn(req torrReqJS, c *gin.Context) {
 			}
 		}
 		go func() {
+			url := set.JlfnSrv
+			if url != "" {
+				url = url + "/library/refresh"
+				apikey := set.JlfnApi
+
+				if apikey !="" {
+					req, err := http.NewRequest("POST", url, nil)
+					if err != nil {
+						log.TLogln(err)
+					}
+					req.Header.Add("X-Emby-Token", apikey)
+
+					client := &http.Client{}
+					resp, err := client.Do(req)
+					if err != nil {
+						log.TLogln(err)
+					}
+					defer resp.Body.Close()
+					log.TLogln("Status:", resp.Status)
+				}
+			}
+
 			time.Sleep(15 * time.Second)
 			torr.DropTorrent(hash)
 		}()
